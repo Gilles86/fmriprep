@@ -8,6 +8,7 @@ fMRI preprocessing workflow
 
 import os
 import os.path as op
+from pathlib import Path
 import logging
 import sys
 import gc
@@ -17,9 +18,6 @@ from argparse import ArgumentParser
 from argparse import RawTextHelpFormatter
 from multiprocessing import cpu_count
 from time import strftime
-import nibabel
-
-nibabel.arrayproxy.KEEP_FILE_OPEN_DEFAULT = 'auto'
 
 logging.addLevelName(25, 'IMPORTANT')  # Add a new level between INFO and WARNING
 logging.addLevelName(15, 'VERBOSE')  # Add a new level between INFO and DEBUG
@@ -30,9 +28,18 @@ def _warn_redirect(message, category, filename, lineno, file=None, line=None):
     logger.warning('Captured warning (%s): %s', category, message)
 
 
+def check_deps(workflow):
+    from nipype.utils.filemanip import which
+    return sorted(
+        (node.interface.__class__.__name__, node.interface._cmd)
+        for node in workflow._get_all_nodes()
+        if (hasattr(node.interface, '_cmd') and
+            which(node.interface._cmd.split()[0]) is None))
+
+
 def get_parser():
     """Build parser object"""
-    from ..info import __version__
+    from ..__about__ import __version__
 
     verstr = 'fmriprep v{}'.format(__version__)
 
@@ -57,8 +64,8 @@ def get_parser():
 
     g_bids = parser.add_argument_group('Options for filtering BIDS queries')
     g_bids.add_argument('--participant_label', '--participant-label', action='store', nargs='+',
-                        help='one or more participant identifiers (the sub- prefix can be '
-                             'removed)')
+                        help='a space delimited list of participant identifiers or a single '
+                             'identifier (the sub- prefix can be removed)')
     # Re-enable when option is actually implemented
     # g_bids.add_argument('-s', '--session-id', action='store', default='single_session',
     #                     help='select a specific session to be processed')
@@ -69,9 +76,7 @@ def get_parser():
                         help='select a specific task to be processed')
 
     g_perfm = parser.add_argument_group('Options to handle performance')
-    g_perfm.add_argument('--debug', action='store_true', default=False,
-                         help='run debug version of workflow')
-    g_perfm.add_argument('--nthreads', '--n_cpus', '-n-cpus', action='store', default=0, type=int,
+    g_perfm.add_argument('--nthreads', '--n_cpus', '-n-cpus', action='store', type=int,
                          help='maximum number of threads across all processes')
     g_perfm.add_argument('--omp-nthreads', action='store', type=int, default=0,
                          help='maximum number of threads per-process')
@@ -84,6 +89,8 @@ def get_parser():
                          help='nipype plugin configuration file')
     g_perfm.add_argument('--anat-only', action='store_true',
                          help='run anatomical workflows only')
+    g_perfm.add_argument('--boilerplate', action='store_true',
+                         help='generate boilerplate only')
     g_perfm.add_argument('--ignore-aroma-denoising-errors', action='store_true',
                          default=False,
                          help='ignores the errors ICA_AROMA returns when there '
@@ -91,13 +98,15 @@ def get_parser():
                               'signal')
     g_perfm.add_argument("-v", "--verbose", dest="verbose_count", action="count", default=0,
                          help="increases log verbosity for each occurence, debug level is -vvv")
+    g_perfm.add_argument('--debug', action='store_true', default=False,
+                         help='DEPRECATED - Does not do what you want.')
 
     g_conf = parser.add_argument_group('Workflow configuration')
     g_conf.add_argument(
         '--ignore', required=False, action='store', nargs="+", default=[],
-        choices=['fieldmaps', 'slicetiming'],
+        choices=['fieldmaps', 'slicetiming', 'sbref'],
         help='ignore selected aspects of the input dataset to disable corresponding '
-             'parts of the workflow')
+             'parts of the workflow (a space delimited list)')
     g_conf.add_argument(
         '--longitudinal', action='store_true',
         help='treat dataset as longitudinal - may increase runtime')
@@ -107,10 +116,9 @@ def get_parser():
              'T2*-driven coregistration. When multi-echo data is provided and this '
              'option is not enabled, standard EPI-T1 coregistration is performed '
              'using the middle echo.')
-    g_conf.add_argument('--bold2t1w-dof', action='store', default=9, choices=[6, 9, 12], type=int,
+    g_conf.add_argument('--bold2t1w-dof', action='store', default=6, choices=[6, 9, 12], type=int,
                         help='Degrees of freedom when registering BOLD to T1w images. '
-                             '9 (rotation, translation, and scaling) is used by '
-                             'default to compensate for field inhomogeneities.')
+                             '6 degrees (rotation and translation) are used by default.')
     g_conf.add_argument(
         '--output-space', required=False, action='store',
         choices=['T1w', 'template', 'fsnative', 'fsaverage', 'fsaverage6', 'fsaverage5'],
@@ -119,7 +127,9 @@ def get_parser():
              ' - T1w: subject anatomical volume\n'
              ' - template: normalization target specified by --template\n'
              ' - fsnative: individual subject surface\n'
-             ' - fsaverage*: FreeSurfer average meshes'
+             ' - fsaverage*: FreeSurfer average meshes\n'
+             'this argument can be single value or a space delimited list,\n'
+             'for example: --output-space T1w fsnative'
     )
     g_conf.add_argument(
         '--force-bbr', action='store_true', dest='use_bbr', default=None,
@@ -132,8 +142,15 @@ def get_parser():
         choices=['MNI152NLin2009cAsym'], default='MNI152NLin2009cAsym',
         help='volume template space (default: MNI152NLin2009cAsym)')
     g_conf.add_argument(
-        '--output-grid-reference', required=False, action='store', default=None,
-        help='Grid reference image for resampling BOLD files to volume template space. '
+        '--output-grid-reference', required=False, action='store',
+        help='Deprecated after FMRIPREP 1.0.8. Please use --template-resampling-grid instead.')
+    g_conf.add_argument(
+        '--template-resampling-grid', required=False, action='store', default='native',
+        help='Keyword ("native", "1mm", or "2mm") or path to an existing file. '
+             'Allows to define a reference grid for the resampling of BOLD images in template '
+             'space. Keyword "native" will use the original BOLD grid as reference. '
+             'Keywords "1mm" and "2mm" will use the corresponding isotropic template '
+             'resolutions. If a path is given, the grid of that image will be used. '
              'It determines the field of view and resolution of the output images, '
              'but is not used in normalization.')
     g_conf.add_argument(
@@ -145,11 +162,19 @@ def get_parser():
     g_aroma = parser.add_argument_group('Specific options for running ICA_AROMA')
     g_aroma.add_argument('--use-aroma', action='store_true', default=False,
                          help='add ICA_AROMA to your preprocessing stream')
+    g_aroma.add_argument('--aroma-melodic-dimensionality', action='store',
+                         default=None, type=int,
+                         help='set the dimensionality of MELODIC before running'
+                         'ICA-AROMA')
+
     #  ANTs options
     g_ants = parser.add_argument_group('Specific options for ANTs registrations')
     g_ants.add_argument('--skull-strip-template', action='store', default='OASIS',
                         choices=['OASIS', 'NKI'],
                         help='select ANTs skull-stripping template (default: OASIS))')
+    g_ants.add_argument('--skull-strip-fixed-seed', action='store_true',
+                        help='do not use a random seed for skull-stripping - will ensure '
+                             'run-to-run replicability when used with --omp-nthreads 1')
 
     # Fieldmap options
     g_fmap = parser.add_argument_group('Specific options for handling fieldmaps')
@@ -168,17 +193,23 @@ def get_parser():
 
     # FreeSurfer options
     g_fs = parser.add_argument_group('Specific options for FreeSurfer preprocessing')
-    g_fs.add_argument('--fs-no-reconall', '--no-freesurfer',
-                      action='store_false', dest='run_reconall',
-                      help='disable FreeSurfer surface preprocessing.'
-                      ' Note : `--no-freesurfer` is deprecated and will be removed in 1.2.'
-                      ' Use `--fs-no-reconall` instead.')
-    g_fs.add_argument('--no-submm-recon', action='store_false', dest='hires',
-                      help='disable sub-millimeter (hires) reconstruction')
     g_fs.add_argument(
         '--fs-license-file', metavar='PATH', type=os.path.abspath,
         help='Path to FreeSurfer license key file. Get it (for free) by registering'
              ' at https://surfer.nmr.mgh.harvard.edu/registration.html')
+
+    # Surface generation xor
+    g_surfs = parser.add_argument_group('Surface preprocessing options')
+    g_surfs.add_argument('--no-submm-recon', action='store_false', dest='hires',
+                         help='disable sub-millimeter (hires) reconstruction')
+    g_surfs_xor = g_surfs.add_mutually_exclusive_group()
+    g_surfs_xor.add_argument('--cifti-output', action='store_true', default=False,
+                             help='output BOLD files as CIFTI dtseries')
+    g_surfs_xor.add_argument('--fs-no-reconall', '--no-freesurfer',
+                             action='store_false', dest='run_reconall',
+                             help='disable FreeSurfer surface preprocessing.'
+                             ' Note : `--no-freesurfer` is deprecated and will be removed in 1.2.'
+                             ' Use `--fs-no-reconall` instead.')
 
     g_other = parser.add_argument_group('Other options')
     g_other.add_argument('-w', '--work-dir', action='store',
@@ -199,22 +230,31 @@ def get_parser():
     g_other.add_argument('--stop-on-first-crash', action='store_true', default=False,
                          help='Force stopping on first crash, even if a work directory'
                               ' was specified.')
+    g_other.add_argument('--notrack', action='store_true', default=False,
+                         help='Opt-out of sending tracking information of this run to '
+                              'the FMRIPREP developers. This information helps to '
+                              'improve FMRIPREP and provides an indicator of real '
+                              'world usage crucial for obtaining funding.')
+    g_other.add_argument('--sloppy', action='store_true', default=False,
+                         help='Use low-quality tools for speed - TESTING ONLY')
 
     return parser
 
 
 def main():
     """Entry point"""
-    from niworkflows.nipype import logging as nlogging
+    from nipype import logging as nlogging
     from multiprocessing import set_start_method, Process, Manager
+    from .. import __version__
     from ..viz.reports import generate_reports
+    from ..utils.bids import write_derivative_description
     set_start_method('forkserver')
 
     warnings.showwarning = _warn_redirect
     opts = get_parser().parse_args()
 
     # FreeSurfer license
-    default_license = op.join(os.getenv('FREESURFER_HOME', ''), 'license.txt')
+    default_license = str(Path(os.getenv('FREESURFER_HOME')) / 'license.txt')
     # Precedence: --fs-license-file, $FS_LICENSE, default_license
     license_file = opts.fs_license_file or os.getenv('FS_LICENSE', default_license)
     if not os.path.exists(license_file):
@@ -231,9 +271,9 @@ def main():
     log_level = int(max(25 - 5 * opts.verbose_count, logging.DEBUG))
     # Set logging
     logger.setLevel(log_level)
-    nlogging.getLogger('workflow').setLevel(log_level)
-    nlogging.getLogger('interface').setLevel(log_level)
-    nlogging.getLogger('utils').setLevel(log_level)
+    nlogging.getLogger('nipype.workflow').setLevel(log_level)
+    nlogging.getLogger('nipype.interface').setLevel(log_level)
+    nlogging.getLogger('nipype.utils').setLevel(log_level)
 
     errno = 0
 
@@ -244,8 +284,12 @@ def main():
         p.start()
         p.join()
 
+        if p.exitcode != 0:
+            sys.exit(p.exitcode)
+
         fmriprep_wf = retval['workflow']
         plugin_settings = retval['plugin_settings']
+        bids_dir = retval['bids_dir']
         output_dir = retval['output_dir']
         work_dir = retval['work_dir']
         subject_list = retval['subject_list']
@@ -261,6 +305,37 @@ def main():
     if opts.reports_only:
         sys.exit(int(retcode > 0))
 
+    if opts.boilerplate:
+        sys.exit(int(retcode > 0))
+
+    # Sentry tracking
+    if not opts.notrack:
+        try:
+            from raven import Client
+            dev_user = bool(int(os.getenv('FMRIPREP_DEV', 0)))
+            msg = 'fMRIPrep running%s' % (int(dev_user) * ' [dev]')
+            client = Client(
+                'https://d5a16b0c38d84d1584dfc93b9fb1ade6:'
+                '21f3c516491847af8e4ed249b122c4af@sentry.io/1137693',
+                release=__version__)
+            client.captureMessage(message=msg,
+                                  level='debug' if dev_user else 'info',
+                                  tags={
+                                      'run_id': run_uuid,
+                                      'npart': len(subject_list),
+                                      'type': 'ping',
+                                      'dev': dev_user})
+        except Exception:
+            pass
+
+    # Check workflow for missing commands
+    missing = check_deps(fmriprep_wf)
+    if missing:
+        print("Cannot run fMRIPrep. Missing dependencies:")
+        for iface, cmd in missing:
+            print("\t{} (Interface: {})".format(cmd, iface))
+        sys.exit(2)
+
     # Clean up master process before running workflow, which may create forks
     gc.collect()
     try:
@@ -273,6 +348,7 @@ def main():
 
     # Generate reports phase
     errno += generate_reports(subject_list, output_dir, work_dir, run_uuid)
+    write_derivative_description(bids_dir, str(Path(output_dir) / 'fmriprep'))
     sys.exit(int(errno > 0))
 
 
@@ -288,13 +364,16 @@ def build_workflow(opts, retval):
     a hard-limited memory-scope.
 
     """
-    from niworkflows.nipype import logging, config as ncfg
-    from ..info import __version__
+    from subprocess import check_call, CalledProcessError, TimeoutExpired
+    from pkg_resources import resource_filename as pkgrf
+
+    from nipype import logging, config as ncfg
+    from ..__about__ import __version__
     from ..workflows.base import init_fmriprep_wf
     from ..utils.bids import collect_participants
     from ..viz.reports import generate_reports
 
-    logger = logging.getLogger('workflow')
+    logger = logging.getLogger('nipype.workflow')
 
     INIT_MSG = """
     Running fMRIPREP version {version}:
@@ -303,53 +382,67 @@ def build_workflow(opts, retval):
       * Run identifier: {uuid}.
     """.format
 
+    output_spaces = opts.output_space or []
+
     # Validity of some inputs
     # ERROR check if use_aroma was specified, but the correct template was not
     if opts.use_aroma and (opts.template != 'MNI152NLin2009cAsym' or
-                           'template' not in opts.output_space):
-        raise RuntimeError('ERROR: --use-aroma requires functional images to be resampled to '
-                           'MNI152NLin2009cAsym.\n'
-                           '\t--template must be set to "MNI152NLin2009cAsym" (was: "{}")\n'
-                           '\t--output-space list must include "template" (was: "{}")'.format(
-                               opts.template, ' '.join(opts.output_space)))
+                           'template' not in output_spaces):
+        output_spaces.append('template')
+        logger.warning(
+            'Option "--use-aroma" requires functional images to be resampled to MNI space. '
+            'The argument "template" has been automatically added to the list of output '
+            'spaces (option "--output-space").'
+        )
+
     # Check output_space
-    if 'template' not in opts.output_space and (opts.use_syn_sdc or opts.force_syn):
-        msg = ('SyN SDC correction requires T1 to MNI registration, but '
-               '"template" is not specified in "--output-space" arguments')
+    if 'template' not in output_spaces and (opts.use_syn_sdc or opts.force_syn):
+        msg = ['SyN SDC correction requires T1 to MNI registration, but '
+               '"template" is not specified in "--output-space" arguments.',
+               'Option --use-syn will be cowardly dismissed.']
         if opts.force_syn:
-            raise RuntimeError(msg)
-        logger.warning(msg)
+            output_spaces.append('template')
+            msg[1] = (' Since --force-syn has been requested, "template" has been added to'
+                      ' the "--output-space" list.')
+        logger.warning(' '.join(msg))
 
     # Set up some instrumental utilities
     run_uuid = '%s_%s' % (strftime('%Y%m%d-%H%M%S'), uuid.uuid4())
 
     # First check that bids_dir looks like a BIDS folder
-    bids_dir = op.abspath(opts.bids_dir)
+    bids_dir = os.path.abspath(opts.bids_dir)
     subject_list = collect_participants(
         bids_dir, participant_label=opts.participant_label)
 
-    # Setting up MultiProc
-    nthreads = opts.nthreads
-    if nthreads < 1:
-        nthreads = cpu_count()
-
-    plugin_settings = {
-        'plugin': 'MultiProc',
-        'plugin_args': {
-            'n_procs': nthreads,
-            'raise_insufficient': False,
-            'maxtasksperchild': 1,
-        }
-    }
-
-    if opts.mem_mb:
-        plugin_settings['plugin_args']['memory_gb'] = opts.mem_mb / 1024
-
-    # Overload plugin_settings if --use-plugin
+    # Load base plugin_settings from file if --use-plugin
     if opts.use_plugin is not None:
         from yaml import load as loadyml
         with open(opts.use_plugin) as f:
             plugin_settings = loadyml(f)
+        plugin_settings.setdefault('plugin_args', {})
+    else:
+        # Defaults
+        plugin_settings = {
+            'plugin': 'MultiProc',
+            'plugin_args': {
+                'raise_insufficient': False,
+                'maxtasksperchild': 1,
+            }
+        }
+
+    # Resource management options
+    # Note that we're making strong assumptions about valid plugin args
+    # This may need to be revisited if people try to use batch plugins
+    nthreads = plugin_settings['plugin_args'].get('n_procs')
+    # Permit overriding plugin config with specific CLI options
+    if nthreads is None or opts.nthreads is not None:
+        nthreads = opts.nthreads
+        if nthreads is None or nthreads < 1:
+            nthreads = cpu_count()
+        plugin_settings['plugin_args']['n_procs'] = nthreads
+
+    if opts.mem_mb:
+        plugin_settings['plugin_args']['memory_gb'] = opts.mem_mb / 1024
 
     omp_nthreads = opts.omp_nthreads
     if omp_nthreads == 0:
@@ -394,6 +487,7 @@ def build_workflow(opts, retval):
 
     retval['return_code'] = 0
     retval['plugin_settings'] = plugin_settings
+    retval['bids_dir'] = bids_dir
     retval['output_dir'] = output_dir
     retval['work_dir'] = work_dir
     retval['subject_list'] = subject_list
@@ -416,26 +510,37 @@ def build_workflow(opts, retval):
         uuid=run_uuid)
     )
 
+    template_out_grid = opts.template_resampling_grid
+    if opts.output_grid_reference is not None:
+        logger.warning(
+            'Option --output-grid-reference is deprecated, please use '
+            '--template-resampling-grid')
+        template_out_grid = template_out_grid or opts.output_grid_reference
+    if opts.debug:
+        logger.warning('Option --debug is deprecated and has no effect')
+
     retval['workflow'] = init_fmriprep_wf(
         subject_list=subject_list,
         task_id=opts.task_id,
         run_uuid=run_uuid,
         ignore=opts.ignore,
-        debug=opts.debug,
+        debug=opts.sloppy,
         low_mem=opts.low_mem,
         anat_only=opts.anat_only,
         longitudinal=opts.longitudinal,
         t2s_coreg=opts.t2s_coreg,
         omp_nthreads=omp_nthreads,
         skull_strip_template=opts.skull_strip_template,
+        skull_strip_fixed_seed=opts.skull_strip_fixed_seed,
         work_dir=work_dir,
         output_dir=output_dir,
         bids_dir=bids_dir,
         freesurfer=opts.run_reconall,
-        output_spaces=opts.output_space,
+        output_spaces=output_spaces,
         template=opts.template,
         medial_surface_nan=opts.medial_surface_nan,
-        output_grid_ref=opts.output_grid_reference,
+        cifti_output=opts.cifti_output,
+        template_out_grid=template_out_grid,
         hires=opts.hires,
         use_bbr=opts.use_bbr,
         bold2t1w_dof=opts.bold2t1w_dof,
@@ -444,9 +549,39 @@ def build_workflow(opts, retval):
         use_syn=opts.use_syn_sdc,
         force_syn=opts.force_syn,
         use_aroma=opts.use_aroma,
+        aroma_melodic_dim=opts.aroma_melodic_dimensionality,
         ignore_aroma_err=opts.ignore_aroma_denoising_errors,
     )
     retval['return_code'] = 0
+
+    logs_path = Path(output_dir) / 'fmriprep' / 'logs'
+    boilerplate = retval['workflow'].visit_desc()
+    (logs_path / 'CITATION.md').write_text(boilerplate)
+    logger.log(25, 'Works derived from this fMRIPrep execution should '
+               'include the following boilerplate:\n\n%s', boilerplate)
+
+    # Generate HTML file resolving citations
+    cmd = ['pandoc', '-s', '--bibliography',
+           pkgrf('fmriprep', 'data/boilerplate.bib'),
+           '--filter', 'pandoc-citeproc',
+           str(logs_path / 'CITATION.md'),
+           '-o', str(logs_path / 'CITATION.html')]
+    try:
+        check_call(cmd, timeout=10)
+    except (FileNotFoundError, CalledProcessError, TimeoutExpired):
+        logger.warning('Could not generate CITATION.html file:\n%s',
+                       ' '.join(cmd))
+
+    # Generate LaTex file resolving citations
+    cmd = ['pandoc', '-s', '--bibliography',
+           pkgrf('fmriprep', 'data/boilerplate.bib'),
+           '--natbib', str(logs_path / 'CITATION.md'),
+           '-o', str(logs_path / 'CITATION.tex')]
+    try:
+        check_call(cmd, timeout=10)
+    except (FileNotFoundError, CalledProcessError, TimeoutExpired):
+        logger.warning('Could not generate CITATION.tex file:\n%s',
+                       ' '.join(cmd))
     return retval
 
 

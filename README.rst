@@ -8,6 +8,10 @@ This pipeline is developed by the `Poldrack lab at Stanford University
 Neuroscience (CRN) <http://reproducibility.stanford.edu/>`_, as well as for
 open-source software distribution.
 
+.. image:: http://bids.neuroimaging.io/openneuro_badge.svg
+  :target: https://openneuro.org
+  :alt: Available in OpenNeuro!
+
 .. image:: https://circleci.com/gh/poldracklab/fmriprep/tree/master.svg?style=shield
   :target: https://circleci.com/gh/poldracklab/fmriprep/tree/master
 
@@ -22,6 +26,9 @@ open-source software distribution.
 
 About
 -----
+
+.. image:: https://github.com/oesteban/fmriprep/raw/38a63e9504ab67812b63813c5fe9af882109408e/docs/_static/fmriprep-workflow-all.png
+
 
 ``fmriprep`` is a functional magnetic resonance imaging (fMRI) data
 preprocessing pipeline that is designed to provide an easily accessible,
@@ -82,6 +89,30 @@ Principles
    This, combined with the documentation, can help researchers to understand
    the process and decide which subjects should be kept for the group level
    analysis.
+
+
+Limitations and reasons not to use ``fmriprep``
+-----------------------------------------------
+
+1. Very narrow :abbr:`FoV (field-of-view)` images oftentimes do not contain
+   enough information for standard image registration methods to work correctly.
+   Also, problems may arise when extracting the brain from these data.
+   Supporting these particular images is already a future line of the development
+   road-map.
+2. ``fmriprep`` may also underperform for particular populations (e.g. infants) and
+   non-human brains, although appropriate templates can be provided to overcome the
+   issue.
+3. The "EPInorm" approach is currently not supported, although we plan to implement
+   this feature (see `#857 <https://github.com/poldracklab/fmriprep/issues/857>`_).
+4. If you really want unlimited flexibility (which is obviously a double-edged sword).
+5. If you want students to suffer through implementing each step for didactic purposes,
+   or to learn shell-scripting or Python along the way.
+6. If you are trying to reproduce some *in-house* lab pipeline.
+
+(Reasons 4-6 were kindly provided by S. Nastase in his
+`open review <http://academickarma.org/review/j7d5501n779n>`__
+of our `pre-print <https://www.biorxiv.org/content/early/2018/05/06/306951>`__).
+
 
 Acknowledgements
 ----------------

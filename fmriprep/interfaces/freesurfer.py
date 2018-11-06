@@ -15,8 +15,8 @@ Fetch some example data:
 
 Disable warnings:
 
-    >>> import niworkflows.nipype as nn
-    >>> nn.logging.getLogger('interface').setLevel('ERROR')
+    >>> from nipype import logging
+    >>> logging.getLogger('nipype.interface').setLevel('ERROR')
 
 """
 
@@ -28,13 +28,15 @@ from skimage import morphology as sim
 from scipy.ndimage.morphology import binary_fill_holes
 from nilearn.image import resample_to_img, new_img_like
 
-from niworkflows.nipype.utils.filemanip import copyfile, filename_to_list, fname_presuffix
-from niworkflows.nipype.interfaces.base import (
+from nipype.utils.filemanip import copyfile, filename_to_list, fname_presuffix
+from nipype.interfaces.base import (
     isdefined, InputMultiPath, BaseInterfaceInputSpec, TraitedSpec, File, traits, Directory
 )
-from niworkflows.nipype.interfaces import freesurfer as fs
-from niworkflows.nipype.interfaces.base import SimpleInterface
-from niworkflows.nipype.interfaces.freesurfer.preprocess import ConcatenateLTA
+from nipype.interfaces import freesurfer as fs
+from nipype.interfaces.base import SimpleInterface
+from nipype.interfaces.freesurfer.preprocess import ConcatenateLTA, RobustRegister
+from nipype.interfaces.freesurfer.utils import LTAConvert
+from niworkflows.interfaces.registration import BBRegisterRPT, MRICoregRPT
 
 
 class StructuralReference(fs.RobustTemplate):
@@ -152,12 +154,15 @@ class FSDetectInputsInputSpec(BaseInterfaceInputSpec):
     t1w_list = InputMultiPath(File(exists=True), mandatory=True,
                               desc='input file, part of a BIDS tree')
     t2w_list = InputMultiPath(File(exists=True), desc='input file, part of a BIDS tree')
+    flair_list = InputMultiPath(File(exists=True), desc='input file, part of a BIDS tree')
     hires_enabled = traits.Bool(True, usedefault=True, desc='enable hi-resolution processing')
 
 
 class FSDetectInputsOutputSpec(TraitedSpec):
     t2w = File(desc='reference T2w image')
     use_t2w = traits.Bool(desc='enable use of T2w downstream computation')
+    flair = File(desc='reference FLAIR image')
+    use_flair = traits.Bool(desc='enable use of FLAIR downstream computation')
     hires = traits.Bool(desc='enable hi-res processing')
     mris_inflate = traits.Str(desc='mris_inflate argument')
 
@@ -167,14 +172,19 @@ class FSDetectInputs(SimpleInterface):
     output_spec = FSDetectInputsOutputSpec
 
     def _run_interface(self, runtime):
-        t2w, self._results['hires'], mris_inflate = detect_inputs(
+        t2w, flair, self._results['hires'], mris_inflate = detect_inputs(
             self.inputs.t1w_list,
-            hires_enabled=self.inputs.hires_enabled,
-            t2w_list=self.inputs.t2w_list if isdefined(self.inputs.t2w_list) else None)
+            t2w_list=self.inputs.t2w_list if isdefined(self.inputs.t2w_list) else None,
+            flair_list=self.inputs.flair_list if isdefined(self.inputs.flair_list) else None,
+            hires_enabled=self.inputs.hires_enabled)
 
         self._results['use_t2w'] = t2w is not None
         if self._results['use_t2w']:
             self._results['t2w'] = t2w
+
+        self._results['use_flair'] = flair is not None
+        if self._results['use_flair']:
+            self._results['flair'] = flair
 
         if self._results['hires']:
             self._results['mris_inflate'] = mris_inflate
@@ -182,36 +192,86 @@ class FSDetectInputs(SimpleInterface):
         return runtime
 
 
-class PatchedConcatenateLTA(ConcatenateLTA):
+class TruncateLTA(object):
+    """Mixin to ensure that LTA files do not store overly long paths,
+    which lead to segmentation faults when read by FreeSurfer tools.
+
+    See the following issues for discussion:
+
+    * https://github.com/freesurfer/freesurfer/pull/180
+    * https://github.com/poldracklab/fmriprep/issues/768
+    * https://github.com/poldracklab/fmriprep/pull/778
+    * https://github.com/poldracklab/fmriprep/issues/1268
+    * https://github.com/poldracklab/fmriprep/pull/1274
+    """
+
+    # Use a tuple in case some object produces multiple transforms
+    lta_outputs = ('out_lta_file',)
+
+    def _post_run_hook(self, runtime):
+
+        outputs = self._list_outputs()
+
+        for lta_name in self.lta_outputs:
+            lta_file = outputs[lta_name]
+            if not isdefined(lta_file):
+                continue
+
+            with open(lta_file, 'r') as f:
+                lines = f.readlines()
+
+            fixed = False
+            newfile = []
+
+            for line in lines:
+                if line.startswith('filename = ') and len(line.strip("\n")) >= 255:
+                    fixed = True
+                    newfile.append('filename = path_too_long\n')
+                else:
+                    newfile.append(line)
+
+            if fixed:
+                with open(lta_file, 'w') as f:
+                    f.write(''.join(newfile))
+
+        runtime = super(TruncateLTA, self)._post_run_hook(runtime)
+
+        return runtime
+
+
+class PatchedConcatenateLTA(TruncateLTA, ConcatenateLTA):
     """
     A temporarily patched version of ``fs.ConcatenateLTA`` to recover from
     `this bug <https://www.mail-archive.com/freesurfer@nmr.mgh.harvard.edu/msg55520.html>`_
     in FreeSurfer, that was
-    `fixed here <https://github.com/freesurfer/freesurfer/pull/180>`_.
+    `fixed here <https://github.com/freesurfer/freesurfer/pull/180>`__.
 
     The original FMRIPREP's issue is found
-    `here <https://github.com/poldracklab/fmriprep/issues/768>`_.
+    `here <https://github.com/poldracklab/fmriprep/issues/768>`__.
+
+    the fix is now done through mixin with TruncateLTA
     """
+    lta_outputs = ['out_file']
 
-    def _list_outputs(self):
-        outputs = super(PatchedConcatenateLTA, self)._list_outputs()
 
-        with open(outputs['out_file'], 'r') as f:
-            lines = f.readlines()
+class PatchedLTAConvert(TruncateLTA, LTAConvert):
+    """
+    LTAconvert is producing a lta file refer as out_lta
+    truncate filename through mixin TruncateLTA
+    """
+    lta_outputs = ('out_lta',)
 
-        fixed = False
-        newfile = []
-        for line in lines:
-            if line.startswith('filename = ') and len(line.strip("\n")) >= 255:
-                fixed = True
-                newfile.append('filename = path_too_long\n')
-            else:
-                newfile.append(line)
 
-        if fixed:
-            with open(outputs['out_file'], 'w') as f:
-                f.write(''.join(newfile))
-        return outputs
+class PatchedBBRegisterRPT(TruncateLTA, BBRegisterRPT):
+    pass
+
+
+class PatchedMRICoregRPT(TruncateLTA, MRICoregRPT):
+    pass
+
+
+class PatchedRobustRegister(TruncateLTA, RobustRegister):
+    lta_outputs = ('out_reg_file', 'half_source_xfm', 'half_targ_xfm')
 
 
 class RefineBrainMaskInputSpec(BaseInterfaceInputSpec):
@@ -302,9 +362,10 @@ def inject_skullstripped(subjects_dir, subject_id, skullstripped):
     return subjects_dir, subject_id
 
 
-def detect_inputs(t1w_list, t2w_list=None, hires_enabled=True):
+def detect_inputs(t1w_list, t2w_list=None, flair_list=None, hires_enabled=True):
     t1w_list = filename_to_list(t1w_list)
     t2w_list = filename_to_list(t2w_list) if t2w_list is not None else []
+    flair_list = filename_to_list(flair_list) if flair_list is not None else []
     t1w_ref = nb.load(t1w_list[0])
     # Use high resolution preprocessing if voxel size < 1.0mm
     # Tolerance of 0.05mm requires that rounds down to 0.9mm or lower
@@ -314,9 +375,14 @@ def detect_inputs(t1w_list, t2w_list=None, hires_enabled=True):
     if t2w_list and max(nb.load(t2w_list[0]).header.get_zooms()) < 1.2:
         t2w = t2w_list[0]
 
+    # Prefer T2w to FLAIR if both present and T2w satisfies
+    flair = None
+    if flair_list and not t2w and max(nb.load(flair_list[0]).header.get_zooms()) < 1.2:
+        flair = flair_list[0]
+
     # https://surfer.nmr.mgh.harvard.edu/fswiki/SubmillimeterRecon
     mris_inflate = '-n 50' if hires else None
-    return (t2w, hires, mris_inflate)
+    return (t2w, flair, hires, mris_inflate)
 
 
 def refine_aseg(aseg, ball_size=4):
